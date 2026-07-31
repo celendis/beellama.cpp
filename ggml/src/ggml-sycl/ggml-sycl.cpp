@@ -6127,6 +6127,10 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_sycl_flash_attn_ext_supported(device, op);
+        case GGML_OP_KVARN_WHT:
+        case GGML_OP_KVARN_STORE:
+        case GGML_OP_KVARN_MATERIALIZE:
+            return true;
         default:
             return false;
     }
@@ -6500,11 +6504,57 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
 catch (const sycl::exception &) { return false; }
 catch (...)                     { return false; }
 
+static bool ggml_backend_sycl_kvarn_capabilities(
+        ggml_backend_dev_t dev,
+        ggml_backend_kvarn_capabilities * result) {
+    GGML_UNUSED(dev);
+    if (result == nullptr ||
+            result->struct_size < sizeof(*result) ||
+            result->abi_version != GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION) {
+        return false;
+    }
+    *result = {
+        /* .struct_size                      = */ sizeof(*result),
+        /* .abi_version                      = */ GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION,
+        /* .route_families                   = */ 0,
+        /* .supported_head_dims              = */ GGML_BACKEND_KVARN_HEAD_DIM_128,
+        /* .store_materialize                = */ 1,
+        /* .portable_direct_body             = */ 0,
+        /* .portable_integrated_tail_f16     = */ 0,
+        /* .portable_integrated_tail_bf16    = */ 0,
+        /* .specialized_generic_mma          = */ 0,
+        /* .specialized_decode_split         = */ 0,
+        /* .specialized_decode_vector        = */ 0,
+    };
+    return true;
+}
+
+static bool ggml_backend_sycl_kvarn_native_ops(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+    return true;
+}
+
+static bool ggml_backend_sycl_kvarn_native_original_v(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+    return false;
+}
+
 static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, const char *name) {
     GGML_UNUSED(reg);
 
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *)ggml_backend_sycl_split_buffer_type;
+    }
+
+    // KVarN capabilities
+    if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
+        return (void *)ggml_backend_sycl_kvarn_capabilities;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
+        return (void *)ggml_backend_sycl_kvarn_native_ops;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_native_original_v") == 0) {
+        return (void *)ggml_backend_sycl_kvarn_native_original_v;
     }
 
     // Tensor parallelism (--split-mode tensor) entry points.
