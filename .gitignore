@@ -163,3 +163,5 @@ AGENTS.local.md
 /artifacts/
 /release-packages/*/
 /servers
+sycl_probe/build/
+/build/
