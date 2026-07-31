@@ -193,18 +193,36 @@ For every kernel, compare against CUDA output:
 
 | Phase | Work | Duration |
 |-------|------|----------|
-| Phase 1: Store + Materialize + WHT | ~2500 lines of SYCL code | 3-5 days |
+| ~~Phase 1: WHT~~ | ~~kvarn-wht.cpp~~ | ~~✅ Done~~ |
+| Phase 1: Store (1a-1d) | ~1800 lines | 2-3 days |
+| Phase 1: Materialize | ~600 lines | 1 day |
 | Phase 1: Backend integration + testing | CMake, ggml-sycl.cpp, tests | 1-2 days |
 | Phase 2: XMX probe + scalar fattn fallback | ~1500 lines | 1-2 weeks |
 | Phase 2: XMX accelerated path | Template matrix + tuning | 1-2 weeks |
 | **Total** | **~6500 lines** | **4-7 weeks** |
 
+## Store Kernel Sub-Phases
+
+The store kernel (~2000 lines in CUDA) breaks into incremental, testable stages:
+
+| Phase | Scope | What It Does | Test |
+|-------|-------|--------------|------|
+| 1a | Skeleton + Load/Store | Kernel structure, local memory, load F16→F32, write F32→F16 | Data round-trips unchanged |
+| 1b | WHT Integration | Inline butterfly stages + scale from kvarn-wht.cpp | Matches standalone WHT output |
+| 1c | Normalization | Per-column z-score (mean/variance reduction), per-row z-score | Mean ≈ 0, std ≈ 1 per axis |
+| 1d | Quantization + Packing | Convert to unsigned ints at target bit-width, pack bits into records | Records match CUDA byte-exact |
+| 2 | Swarms (multi-stream) | Stage groups, stream routing, eager emit | Multi-token correctness |
+| 3 | Low shared memory variant | Reduced local memory path for constrained workloads | Matches headwide output |
+
+**Materialize** is simpler — single-pass reverse: unpack → dequantize → inverse WHT → F16.
+
 ## First Steps
 
-1. Fix the XMX capability probe (compile errors in `sycl::ext::oneapi::matrix` API)
-2. Implement `kvarn-wht.cpp` (smallest, purest kernel — good warmup)
-3. Implement `kvarn.cpp` store kernel (headwide variant only)
-4. Wire up in `ggml-sycl.cpp`
-5. Test with a trivial model + KVarN cache type
-6. Implement materialize
-7. Full correctness validation against CUDA
+1. ~~Implement `kvarn-wht.cpp`~~ ✅ **DONE** — committed to `sycl-kvarn` branch
+2. Implement `kvarn.cpp` Phase 1a (skeleton + load/store)
+3. Phase 1b (WHT integration)
+4. Phase 1c (normalization)
+5. Phase 1d (quantization + packing)
+6. Wire up `GGML_OP_KVARN_STORE` in `ggml-sycl.cpp`
+7. Implement materialize
+8. Full correctness validation against CUDA
