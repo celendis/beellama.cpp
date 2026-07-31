@@ -58,6 +58,7 @@
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
+#include "ggml-sycl/kvarn-wht.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/set_rows.hpp"
@@ -5229,6 +5230,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_sycl_flash_attn_ext(ctx, dst);
+            break;
+        case GGML_OP_KVARN_WHT:
+            ggml_sycl_op_kvarn_wht(ctx, dst);
             break;
         default:
             return false;
