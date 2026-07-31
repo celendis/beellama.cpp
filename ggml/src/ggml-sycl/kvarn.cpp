@@ -16,8 +16,13 @@ static constexpr int KVAR_N_SHARED_BYTES = KVAR_N_SHARED_FLOATS * sizeof(float);
 // Op param indices (match ggml-cuda/kvarn.cu)
 static constexpr int KVAR_N_OP_PARAM_BITS = 0;
 static constexpr int KVAR_N_OP_PARAM_ITERS = 1;
+static constexpr int KVAR_N_OP_PARAM_MAT_VALUE = 1;
 static constexpr int KVAR_N_OP_PARAM_STORE_VALUE = 2;
+static constexpr int KVAR_N_OP_PARAM_MAT_STREAM_START = 2;
+static constexpr int KVAR_N_OP_PARAM_MAT_N_STREAM = 3;
+static constexpr int KVAR_N_OP_PARAM_MAT_EMIT_ROTATED = 4;
 static constexpr int KVAR_N_OP_PARAM_STORE_SWA = 4;
+static constexpr int KVAR_N_OP_PARAM_MAT_SWA = 6;
 static constexpr int KVAR_N_OP_PARAM_HEAD_SLICES = 5;
 static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;
@@ -630,9 +635,297 @@ void ggml_sycl_op_kvarn_store(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     }
 }
 
-// Placeholder — materialize not yet implemented
+// Dequantize a single value from a record
+static inline __attribute__((always_inline)) float kvarn_materialize_record_value(
+        const uint8_t * record, int bits, bool value, int token, int dim) {
+    const int payload_bytes = KVAR_N_TILE_VALUES * bits / 8;
+    const int row = value ? token : dim;
+    const int col = value ? dim : token;
+    const size_t bit_offset = size_t(row * KVAR_N_DIM + col) * size_t(bits);
+    uint8_t q = 0;
+    for (int bit = 0; bit < bits; ++bit) {
+        const size_t src_bit = bit_offset + size_t(bit);
+        q |= uint8_t(((record[src_bit / 8] >> (src_bit % 8)) & 1u) << bit);
+    }
+    const sycl::half * scale_axis = reinterpret_cast<const sycl::half *>(record + payload_bytes);
+    const sycl::half * zp_axis = scale_axis + KVAR_N_DIM;
+    const sycl::half * other_axis = zp_axis + KVAR_N_DIM;
+    return (float(q) * static_cast<float>(scale_axis[row]) + static_cast<float>(zp_axis[row])) *
+        static_cast<float>(other_axis[col]);
+}
+
+// Materialize kernel: read from stage or records → inverse WHT → F16 output
+template<int SLICES>
+static void kvarn_materialize_kernel(
+        const uint8_t * __restrict__ records,
+        const sycl::half * __restrict__ stage,
+        const int64_t * __restrict__ indices,
+        const int64_t * __restrict__ live,
+        sycl::half * __restrict__ output,
+        int n_heads,
+        int n_kv,
+        int stream_start,
+        int n_stream,
+        int groups_per_stream,
+        int record_bytes,
+        int bits,
+        bool value,
+        bool emit_rotated,
+        bool swa,
+        int stage_groups,
+        int tail_groups,
+        bool eager_records,
+        queue_ptr q_ptr) {
+
+    sycl::queue q = *q_ptr;
+    const int n_logical_heads = n_heads / SLICES;
+    sycl::nd_range<1> nd_range{n_kv * n_logical_heads * n_stream * 128, 128};
+
+    q.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> shared_rows{sycl::range<1>(SLICES * KVAR_N_DIM), cgh};
+        float * shared_rows_ptr = shared_rows.get_pointer();
+
+        cgh.parallel_for<>(nd_range, [=](sycl::nd_item<1> item) {
+            const int64_t global_id = item.get_group(0);
+            const int dim = item.get_local_id()[0];
+
+            const int out_stream = global_id / (n_kv * n_logical_heads);
+            const int remainder = global_id % (n_kv * n_logical_heads);
+            const int logical_head = remainder / n_kv;
+            const int cell = remainder % n_kv;
+
+            if (cell >= n_kv || out_stream >= n_stream) return;
+
+            float values[4] = {0};
+            const int64_t abs_pos = swa ? indices[cell] : cell;
+            if (abs_pos >= 0) {
+                const int64_t group = abs_pos / KVAR_N_DIM;
+                const int64_t pos = abs_pos % KVAR_N_DIM;
+                const int64_t live_group = live[2*out_stream + 0];
+                const int64_t live_pos = live[2*out_stream + 1];
+                const int stream = stream_start + out_stream;
+                const int64_t stage_base = int64_t(stream) * KVAR_N_DIM * stage_groups;
+
+                bool from_stage = false;
+                bool from_record = false;
+                int64_t stage_pos = 0;
+                int64_t record_group = 0;
+
+                if (eager_records) {
+                    from_stage = (!swa && group == 0) || (group == live_group && live_pos < KVAR_N_DIM - 1);
+                    const bool completed = group < live_group || (group == live_group && live_pos == KVAR_N_DIM - 1);
+                    from_record = !from_stage && completed && (swa ?
+                        (group >= 0 && live_group - group < groups_per_stream) :
+                        (group > 0 && group < groups_per_stream));
+                    stage_pos = stage_base + (swa ? group % stage_groups :
+                        (group == 0 ? 0 : 1 + ((group - 1) % tail_groups))) * KVAR_N_DIM + pos;
+                    record_group = int64_t(stream) * groups_per_stream + (swa ? group % groups_per_stream : group);
+                } else if (swa) {
+                    const int64_t stage_begin = live_group >= tail_groups - 1 ? live_group - (tail_groups - 1) : 0;
+                    from_stage = group >= stage_begin && group <= live_group;
+                    from_record = !from_stage && group >= 0 && group < stage_begin &&
+                        live_group - group < groups_per_stream + tail_groups;
+                    stage_pos = stage_base + (group % stage_groups) * KVAR_N_DIM + pos;
+                    record_group = int64_t(stream) * groups_per_stream + group % groups_per_stream;
+                } else {
+                    from_stage = group == 0 || (group > 0 && group <= live_group &&
+                        group + (tail_groups - 1) >= live_group);
+                    from_record = !from_stage && group < live_group && group < groups_per_stream;
+                    stage_pos = stage_base + (group == 0 ? pos :
+                        KVAR_N_DIM + ((group - 1) % tail_groups) * KVAR_N_DIM + pos);
+                    record_group = int64_t(stream) * groups_per_stream + group;
+                }
+
+                for (int slice = 0; slice < SLICES; ++slice) {
+                    const int h = logical_head * SLICES + slice;
+                    if (from_stage) {
+                        values[slice] = static_cast<float>(stage[(stage_pos * n_heads + h) * KVAR_N_DIM + dim]);
+                    } else if (from_record) {
+                        const uint8_t * record = records + (record_group * n_heads + h) * record_bytes;
+                        values[slice] = kvarn_materialize_record_value(record, bits, value, int(pos), dim);
+                    }
+                }
+            }
+
+            // Inverse WHT (same as forward WHT, just rescaled)
+            if (!emit_rotated) {
+                for (int slice = 0; slice < SLICES; ++slice) {
+                    shared_rows_ptr[slice * KVAR_N_DIM + dim] = values[slice];
+                }
+                item.barrier();
+
+                for (int slice = 0; slice < SLICES; ++slice) {
+                    float * tile = shared_rows_ptr + slice * KVAR_N_DIM;
+                    // WHT butterfly (self-inverse up to scale)
+                    for (int h = 1; h < KVAR_N_DIM; h *= 2) {
+                        if (dim < 64) {
+                            const int j = (dim / h) * (2 * h) + (dim % h);
+                            const float a = tile[j];
+                            const float b = tile[j + h];
+                            tile[j] = a + b;
+                            tile[j + h] = a - b;
+                        }
+                        item.barrier();
+                    }
+                    tile[dim] *= 0.08838834764831845f;
+                    values[slice] = tile[dim];
+                }
+                item.barrier();
+
+                // Cross-slice Hadamard
+                if (SLICES == 2) {
+                    const float a = values[0];
+                    const float b = values[1];
+                    values[0] = (a + b) * 0.7071067811865475f;
+                    values[1] = (a - b) * 0.7071067811865475f;
+                } else if (SLICES == 4) {
+                    const float a0 = values[0];
+                    const float a1 = values[1];
+                    const float a2 = values[2];
+                    const float a3 = values[3];
+                    const float b0 = a0 + a1;
+                    const float b1 = a0 - a1;
+                    const float b2 = a2 + a3;
+                    const float b3 = a2 - a3;
+                    values[0] = (b0 + b2) * 0.5f;
+                    values[1] = (b1 + b3) * 0.5f;
+                    values[2] = (b0 - b2) * 0.5f;
+                    values[3] = (b1 - b3) * 0.5f;
+                }
+            }
+
+            // Write output
+            for (int slice = 0; slice < SLICES; ++slice) {
+                const int h = logical_head * SLICES + slice;
+                output[((int64_t(out_stream) * n_kv + cell) * n_heads + h) * KVAR_N_DIM + dim] =
+                    static_cast<sycl::half>(values[slice]);
+            }
+        });
+    });
+}
+
+// Live tracking kernel: find the latest live position per stream
+static void kvarn_materialize_live_kernel(
+        const int64_t * __restrict__ indices,
+        int n_indices,
+        int64_t * __restrict__ live,
+        int stream_start,
+        int n_stream,
+        int groups_per_stream,
+        bool swa,
+        queue_ptr q_ptr) {
+
+    sycl::queue q = *q_ptr;
+    sycl::nd_range<1> nd_range{n_stream, 1};
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<>(nd_range, [=](sycl::nd_item<1> item) {
+            const int out_stream = item.get_group(0);
+            if (out_stream >= n_stream) return;
+
+            int64_t live_group = 0;
+            int64_t live_pos = 0;
+            const int stream = stream_start + out_stream;
+
+            for (int i = 0; i < n_indices; ++i) {
+                const int64_t idx = indices[i];
+                if (idx < 0) continue;
+
+                const int64_t group_global = idx / KVAR_N_DIM;
+                const int idx_stream = swa ? stream : int(group_global / groups_per_stream);
+                if (idx_stream != stream) continue;
+
+                const int64_t group = swa ? group_global : group_global - int64_t(stream) * groups_per_stream;
+                const int64_t pos = idx % KVAR_N_DIM;
+                if (group > live_group || (group == live_group && pos > live_pos)) {
+                    live_group = group;
+                    live_pos = pos;
+                }
+            }
+            live[2*out_stream + 0] = live_group;
+            live[2*out_stream + 1] = live_pos;
+        });
+    });
+}
+
 void ggml_sycl_op_kvarn_materialize(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_ABORT("KVarN materialize not yet implemented for SYCL");
+    const ggml_tensor * records = dst->src[0];
+    const ggml_tensor * stage = dst->src[1];
+    const ggml_tensor * indices = dst->src[2];
+    GGML_ASSERT(ggml_is_contiguous(records) && ggml_is_contiguous(stage) &&
+        ggml_is_contiguous(indices) && ggml_is_contiguous(dst));
+
+    const int bits = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_BITS);
+    const bool value = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_VALUE) != 0;
+    const int stream_start = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_STREAM_START);
+    const int n_stream = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_N_STREAM);
+    const bool emit_rotated = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_EMIT_ROTATED) != 0;
+    const bool swa = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_SWA) != 0;
+    const int head_slices_param = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_HEAD_SLICES);
+    const int head_slices = head_slices_param > 0 ? head_slices_param : 1;
+    const int stage_groups = kvarn_resolve_stage_groups(dst);
+    const int tail_groups = kvarn_resolve_tail_groups(dst, stage_groups);
+    const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
+
+    GGML_ASSERT(head_slices == 1 || head_slices == 2 || head_slices == 4);
+
+    const int n_heads = (int)records->ne[1];
+    GGML_ASSERT(n_heads % head_slices == 0);
+    const int n_kv = (int)dst->ne[1];
+    const int groups_per_stream = (int)(records->ne[2] / n_stream);
+
+    // Run live tracking (uses device memory allocated via SYCL)
+    queue_ptr q_ptr = ctx.stream();
+    sycl::queue q = *q_ptr;
+    int64_t * live_dev = sycl::malloc_device<int64_t>(n_stream * 2, q.get_device(), q.get_context());
+    q.memset(live_dev, 0, sizeof(int64_t) * n_stream * 2);
+
+    kvarn_materialize_live_kernel(
+        (const int64_t *)indices->data,
+        (int)indices->ne[0],
+        live_dev,
+        stream_start,
+        n_stream,
+        groups_per_stream,
+        swa,
+        q_ptr
+    );
+
+    // Dispatch materialize kernel
+    if (head_slices == 1) {
+        kvarn_materialize_kernel<1>(
+            (const uint8_t *)records->data,
+            (const sycl::half *)stage->data,
+            (const int64_t *)indices->data,
+            live_dev,
+            (sycl::half *)dst->data,
+            n_heads, n_kv, stream_start, n_stream, groups_per_stream,
+            (int)records->ne[0], bits, value, emit_rotated, swa,
+            stage_groups, tail_groups, eager_records, ctx.stream()
+        );
+    } else if (head_slices == 2) {
+        kvarn_materialize_kernel<2>(
+            (const uint8_t *)records->data,
+            (const sycl::half *)stage->data,
+            (const int64_t *)indices->data,
+            live_dev,
+            (sycl::half *)dst->data,
+            n_heads, n_kv, stream_start, n_stream, groups_per_stream,
+            (int)records->ne[0], bits, value, emit_rotated, swa,
+            stage_groups, tail_groups, eager_records, ctx.stream()
+        );
+    } else {
+        kvarn_materialize_kernel<4>(
+            (const uint8_t *)records->data,
+            (const sycl::half *)stage->data,
+            (const int64_t *)indices->data,
+            live_dev,
+            (sycl::half *)dst->data,
+            n_heads, n_kv, stream_start, n_stream, groups_per_stream,
+            (int)records->ne[0], bits, value, emit_rotated, swa,
+            stage_groups, tail_groups, eager_records, ctx.stream()
+        );
+    }
+
+    sycl::free(live_dev, q.get_context());
 }
