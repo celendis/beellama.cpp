@@ -59,7 +59,8 @@ int main() {
     
     // Upload
     std::vector<float> data(KVAR_N_DIM * n_heads * n_tokens);
-    for (int i = 0; i < (int)data.size(); ++i) data[i] = 1.0f;
+    srand(42);
+    for (int i = 0; i < (int)data.size(); ++i) data[i] = (rand() % 1000 - 500) / 500.0f;
     ggml_backend_tensor_set(current, data.data(), 0, data.size() * sizeof(float));
     std::vector<int64_t> idx_data(n_tokens);
     for (int i = 0; i < n_tokens; ++i) idx_data[i] = i;

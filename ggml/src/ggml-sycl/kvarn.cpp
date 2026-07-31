@@ -871,7 +871,7 @@ void ggml_sycl_op_kvarn_materialize(ggml_backend_sycl_context & ctx, ggml_tensor
 
     const int n_heads = (int)records->ne[1];
     GGML_ASSERT(n_heads % head_slices == 0);
-    const int n_kv = (int)dst->ne[1];
+    const int n_kv = (int)dst->ne[2];
     const int groups_per_stream = (int)(records->ne[2] / n_stream);
 
     // Run live tracking (uses device memory allocated via SYCL)
