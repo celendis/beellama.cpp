@@ -194,8 +194,8 @@ For every kernel, compare against CUDA output:
 | Phase | Work | Duration |
 |-------|------|----------|
 | ~~Phase 1: WHT~~ | ~~kvarn-wht.cpp~~ | ~~✅ Done~~ |
-| Phase 1: Store (1a-1d) | ~1800 lines | 2-3 days |
-| Phase 1: Materialize | ~600 lines | 1 day |
+| ~~Phase 1: Store (1a-1d)~~ | ~~hishmem + headwide~~ | ~~✅ Done~~ |
+| ~~Phase 1: Materialize~~ | ~~live tracking + decode~~ | ~~✅ Done~~ |
 | Phase 1: Backend integration + testing | CMake, ggml-sycl.cpp, tests | 1-2 days |
 | Phase 2: XMX probe + scalar fattn fallback | ~1500 lines | 1-2 weeks |
 | Phase 2: XMX accelerated path | Template matrix + tuning | 1-2 weeks |
