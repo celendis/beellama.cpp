@@ -19,11 +19,15 @@ int main(int argc, char ** argv) {
     ggml_time_init();
 
     // Find SYCL backend via device
+    printf("Backend dev count: %d\n", ggml_backend_dev_count());
     ggml_backend_t sycl_backend = nullptr;
     for (int i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        printf("Dev %d: type=%d\n", i, (int)ggml_backend_dev_type(dev));
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            printf("Init GPU backend %d...\n", i);
             sycl_backend = ggml_backend_dev_init(dev, nullptr);
+            printf("Backend init returned: %p\n", (void *)sycl_backend);
             break;
         }
     }
@@ -32,7 +36,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
     printf("Backend: %s\n", ggml_backend_name(sycl_backend));
-    printf("Device count: %d\n", ggml_backend_dev_count());
 
     // Test parameters
     int bits = 4;
@@ -46,11 +49,11 @@ int main(int argc, char ** argv) {
 
     int record_bytes = (KVAR_N_DIM * KVAR_N_DIM * bits / 8) + (KVAR_N_DIM * 3 * 2); // payload + 3x F16 axes
 
-    // Create context
+    // Create context (no_alloc so gallocr handles device allocation)
     ggml_init_params ctx_params = {
         /* mem_size   = */ 128 * 1024 * 1024,
         /* mem        = */ nullptr,
-        /* no_alloc   = */ false
+        /* no_alloc   = */ true
     };
     struct ggml_context * ctx = ggml_init(ctx_params);
 
@@ -69,14 +72,12 @@ int main(int argc, char ** argv) {
     for (int i = 0; i < KVAR_N_DIM * n_heads * n_tokens; ++i) {
         input_data[i] = static_cast<float>(rand() % 1000 - 500) / 1000.0f;
     }
-    memcpy(ggml_get_data(current), input_data.data(), input_data.size() * sizeof(float));
 
     // Set indices (sequential, one group)
     std::vector<int64_t> indices_data(n_tokens);
     for (int i = 0; i < n_tokens; ++i) {
         indices_data[i] = i; // group 0, positions 0..127
     }
-    memcpy(ggml_get_data(indices), indices_data.data(), indices_data.size() * sizeof(int64_t));
 
     // Allocate buffers on SYCL
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(sycl_backend);
@@ -92,7 +93,16 @@ int main(int argc, char ** argv) {
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, store_op);
 
+    printf("Store op: ne=[%lld, %lld, %lld, %lld]\n",
+           (long long)store_op->ne[0], (long long)store_op->ne[1],
+           (long long)store_op->ne[2], (long long)store_op->ne[3]);
+
     ggml_gallocr_alloc_graph(galloc, graph);
+    printf("Graph allocated\n");
+
+    // Upload data to device
+    ggml_backend_tensor_set(current, input_data.data(), 0, input_data.size() * sizeof(float));
+    ggml_backend_tensor_set(indices, indices_data.data(), 0, indices_data.size() * sizeof(int64_t));
 
     printf("Computing kvarn_store...\n");
     ggml_backend_graph_compute(sycl_backend, graph);
@@ -111,6 +121,7 @@ int main(int argc, char ** argv) {
     ggml_build_forward_expand(graph2, output);
 
     ggml_gallocr_alloc_graph(galloc, graph2);
+    printf("Graph2 allocated\n");
 
     printf("Computing kvarn_materialize...\n");
     ggml_backend_graph_compute(sycl_backend, graph2);
@@ -119,9 +130,11 @@ int main(int argc, char ** argv) {
     ggml_gallocr_free(galloc);
 
     // Read back output
+    printf("Reading output...\n");
     int64_t output_size = output->ne[0] * output->ne[1] * output->ne[2];
     std::vector<float> output_data(output_size);
     ggml_backend_tensor_get(output, output_data.data(), 0, output_data.size() * sizeof(float));
+    printf("Output read: %lld values\n", (long long)output_data.size());
 
     // Compare
     float max_err = 0;

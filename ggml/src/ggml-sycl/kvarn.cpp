@@ -309,9 +309,9 @@ static void kvarn_store_kernel_hishmem(
 
     q.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> shared{sycl::range<1>(KVAR_N_SHARED_FLOATS), cgh};
-        float * shared_ptr = shared.get_pointer();
 
         cgh.parallel_for<>(nd_range, [=](sycl::nd_item<1> item) {
+            float * shared_ptr = shared.get_pointer();
             const int head = item.get_group(0);
             if (head >= n_heads) return;
 
@@ -348,10 +348,10 @@ static void kvarn_store_kernel_hishmem(
                 for (int h = 1; h < KVAR_N_DIM; h *= 2) {
                     if (tid < 64) {
                         const int j = (tid / h) * (2 * h) + (tid % h);
-                        const float a = shared_ptr[j];
-                        const float b = shared_ptr[j + h];
-                        shared_ptr[j] = a + b;
-                        shared_ptr[j + h] = a - b;
+                        const float a = shared[j];
+                        const float b = shared[j + h];
+                        shared[j] = a + b;
+                        shared[j + h] = a - b;
                     }
                     item.barrier();
                 }
@@ -412,9 +412,9 @@ static void kvarn_store_kernel_headwide(
     q.submit([&](sycl::handler& cgh) {
         // Shared memory: SLICES × 128 tile + metadata
         sycl::local_accessor<float, 1> shared{sycl::range<1>(SLICES * KVAR_N_DIM + KVAR_N_SHARED_FLOATS), cgh};
-        float * shared_ptr = shared.get_pointer();
 
         cgh.parallel_for<>(nd_range, [=](sycl::nd_item<1> item) {
+            float * shared_ptr = shared.get_pointer();
             const int group = item.get_group(0);
             if (group >= n_groups) return;
 
@@ -683,9 +683,9 @@ static void kvarn_materialize_kernel(
 
     q.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> shared_rows{sycl::range<1>(SLICES * KVAR_N_DIM), cgh};
-        float * shared_rows_ptr = shared_rows.get_pointer();
 
         cgh.parallel_for<>(nd_range, [=](sycl::nd_item<1> item) {
+            float * shared_rows_ptr = shared_rows.get_pointer();
             const int64_t global_id = item.get_group(0);
             const int dim = item.get_local_id()[0];
 
