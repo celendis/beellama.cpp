@@ -119,7 +119,13 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const ggml_tensor * mask  = dst->src[3];
 
     // KVarN direct-record attention (check before regular dispatches)
-    if (K->type == GGML_TYPE_COUNT || V->type == GGML_TYPE_COUNT) {
+    // Detect by walking through RESHAPE/PERMUTE to find KVARN_VIEW op
+    auto kvarn_view_base = [](const ggml_tensor * t) -> const ggml_tensor * {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE))
+            t = t->src[0];
+        return (t && t->op == GGML_OP_KVARN_VIEW) ? t : nullptr;
+    };
+    if (kvarn_view_base(K) || kvarn_view_base(V)) {
         return BEST_FATTN_KERNEL_KVARN;
     }
 
