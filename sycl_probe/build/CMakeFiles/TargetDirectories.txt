@@ -1,0 +1,4 @@
+/workspaces/beellama-sycl-kvarn/sycl_probe/build/CMakeFiles/xmx_probe.dir
+/workspaces/beellama-sycl-kvarn/sycl_probe/build/CMakeFiles/kvarn_test.dir
+/workspaces/beellama-sycl-kvarn/sycl_probe/build/CMakeFiles/edit_cache.dir
+/workspaces/beellama-sycl-kvarn/sycl_probe/build/CMakeFiles/rebuild_cache.dir

@@ -1,0 +1,1 @@
+dpcpp CMakeFiles/kvarn_test.dir/kvarn_test.cpp.o -o kvarn_test 
