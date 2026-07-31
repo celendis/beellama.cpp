@@ -78,12 +78,25 @@ static void kvarn_store_kernel_hishmem(
 
                 const int stage_base = stream * KVAR_N_DIM * stage_groups;
 
-                // Phase 1a: load F32 into shared memory
+                // Load F32 into shared memory
                 shared[tid] = current[(token * n_heads + head) * KVAR_N_DIM + tid];
                 item.barrier();
 
-                // Phase 1b placeholder: WHT will go here
-                // For now just pass through
+                // WHT: 7-stage butterfly transform
+                for (int h = 1; h < KVAR_N_DIM; h *= 2) {
+                    if (tid < 64) {
+                        const int j = (tid / h) * (2 * h) + (tid % h);
+                        const float a = shared[j];
+                        const float b = shared[j + h];
+                        shared[j] = a + b;
+                        shared[j + h] = a - b;
+                    }
+                    item.barrier();
+                }
+
+                // Scale by 1/√128
+                shared[tid] *= 0.08838834764831845f;
+                item.barrier();
 
                 // Write to F16 stage buffer
                 const int stage_slot = swa ? (group % stage_groups) : (group == 0 ? 0 : 1 + ((group - 1) % tail_groups));
