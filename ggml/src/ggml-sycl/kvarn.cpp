@@ -9,7 +9,8 @@ static constexpr int KVAR_N_DIM = 128;
 static constexpr int KVAR_N_TILE_VALUES = KVAR_N_DIM * KVAR_N_DIM;
 
 // Shared memory layout for headwide variant (F32 tile + metadata)
-static constexpr int KVAR_N_SHARED_FLOATS = KVAR_N_TILE_VALUES + 8 * KVAR_N_DIM + 2;
+static constexpr int KVAR_N_REDUCE_FLOATS = 4 * 4;
+static constexpr int KVAR_N_SHARED_FLOATS = KVAR_N_TILE_VALUES + 8 * KVAR_N_DIM + 2 + KVAR_N_REDUCE_FLOATS;
 static constexpr int KVAR_N_SHARED_BYTES = KVAR_N_SHARED_FLOATS * sizeof(float);
 
 // Op param indices (match ggml-cuda/kvarn.cu)
@@ -29,6 +30,250 @@ static int kvarn_resolve_stage_groups(const ggml_tensor * dst) {
 static int kvarn_resolve_tail_groups(const ggml_tensor * dst, int stage_groups) {
     const int tail_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_TAIL_GROUPS);
     return tail_groups > 0 ? tail_groups : stage_groups - 1;
+}
+
+// Shared memory offsets (match CUDA layout)
+static constexpr int OFF_TILE = 0;
+static constexpr int OFF_LOG_S_COL = KVAR_N_TILE_VALUES;
+static constexpr int OFF_LOG_S_ROW = OFF_LOG_S_COL + KVAR_N_DIM;
+static constexpr int OFF_S_COL = OFF_LOG_S_ROW + KVAR_N_DIM;
+static constexpr int OFF_S_ROW = OFF_S_COL + KVAR_N_DIM;
+static constexpr int OFF_BEST_COL = OFF_S_ROW + KVAR_N_DIM;
+static constexpr int OFF_BEST_ROW = OFF_BEST_COL + KVAR_N_DIM;
+static constexpr int OFF_COL_STD = OFF_BEST_ROW + KVAR_N_DIM;
+static constexpr int OFF_ROW_STD = OFF_COL_STD + KVAR_N_DIM;
+static constexpr int OFF_BEST_IMBALANCE = OFF_ROW_STD + KVAR_N_DIM;
+static constexpr int OFF_BETTER = OFF_BEST_IMBALANCE + 1;
+static constexpr int OFF_REDUCE = OFF_BETTER + 1;
+
+// Compute std dev for a single column (thread = column)
+static inline __attribute__((always_inline)) float kvarn_std_col(const float * tile, const float * s_col, const float * s_row, int col) {
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    const float sc = s_col[col];
+    for (int row = 0; row < KVAR_N_DIM; ++row) {
+        const float value = tile[row * KVAR_N_DIM + col] / (sc * s_row[row]);
+        sum += value;
+        sum_sq += value * value;
+    }
+    const float mean = sum / KVAR_N_DIM;
+    return sqrtf(fmaxf((sum_sq - KVAR_N_DIM * mean * mean) / (KVAR_N_DIM - 1), 0.0f));
+}
+
+// Compute std dev for a single row (thread = row)
+static inline __attribute__((always_inline)) float kvarn_std_row(const float * tile, const float * s_col, const float * s_row, int row) {
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    const float sr = s_row[row];
+    for (int col = 0; col < KVAR_N_DIM; ++col) {
+        const float value = tile[row * KVAR_N_DIM + col] / (s_col[col] * sr);
+        sum += value;
+        sum_sq += value * value;
+    }
+    const float mean = sum / KVAR_N_DIM;
+    return sqrtf(fmaxf((sum_sq - KVAR_N_DIM * mean * mean) / (KVAR_N_DIM - 1), 0.0f));
+}
+
+// Warp-level min reduction (4 warps of 32 lanes each in 128-thread block)
+static inline __attribute__((always_inline)) float kvarn_warp_min(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value = fminf(value, value); // SYCL doesn't have shfl_down; use shared mem instead
+    }
+    return value;
+}
+
+// Warp-level max reduction
+static inline __attribute__((always_inline)) float kvarn_warp_max(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value = fmaxf(value, value);
+    }
+    return value;
+}
+
+// Reduce std ranges across warps using shared memory
+static void kvarn_reduce_std_ranges(const float * col_std, const float * row_std, float * reduce, int tid, sycl::nd_item<1> item) {
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    // Intra-warp reduction via shared memory (no shuffle in oneAPI 2026.1)
+    float col_min = col_std[tid];
+    float col_max = col_std[tid];
+    float row_min = row_std[tid];
+    float row_max = row_std[tid];
+
+    // Write to shared, reduce within warp
+    const int base = OFF_REDUCE + warp * 4;
+    reduce[base + 0] = col_min;
+    reduce[base + 1] = col_max;
+    reduce[base + 2] = row_min;
+    reduce[base + 3] = row_max;
+    item.barrier();
+
+    // Cross-warp reduction (only 4 threads needed)
+    if (tid < 4) {
+        const int metric = tid;
+        float value = reduce[OFF_REDUCE + metric];
+        for (int w = 1; w < 4; ++w) {
+            const float next = reduce[OFF_REDUCE + w * 4 + metric];
+            value = (metric == 0 || metric == 2) ? fminf(value, next) : fmaxf(value, next);
+        }
+        reduce[OFF_REDUCE + metric] = value;
+    }
+    item.barrier();
+}
+
+// Update best scales if current imbalance is better
+static void kvarn_update_best_from_std(
+        const float * candidate_col, const float * candidate_row,
+        bool candidate_is_log,
+        float * best_col, float * best_row,
+        float * col_std, float * row_std,
+        float * best_imbalance, float * better, float * reduce,
+        int tid, sycl::nd_item<1> item) {
+
+    kvarn_reduce_std_ranges(col_std, row_std, reduce, tid, item);
+
+    if (tid == 0) {
+        const float col_min = reduce[OFF_REDUCE + 0];
+        const float col_max = reduce[OFF_REDUCE + 1];
+        const float row_min = reduce[OFF_REDUCE + 2];
+        const float row_max = reduce[OFF_REDUCE + 3];
+        const float imbalance =
+            col_max / fmaxf(col_min, 1e-8f) +
+            row_max / fmaxf(row_min, 1e-8f);
+        *better = imbalance <= *best_imbalance ? 1.0f : 0.0f;
+        if (*better != 0.0f) {
+            *best_imbalance = imbalance;
+        }
+    }
+    item.barrier();
+
+    if (*better != 0.0f) {
+        best_col[tid] = candidate_is_log ? expf(candidate_col[tid]) : candidate_col[tid];
+        best_row[tid] = candidate_is_log ? expf(candidate_row[tid]) : candidate_row[tid];
+    }
+    item.barrier();
+}
+
+// Quantize a 128×128 tile from shared memory into a record
+static void kvarn_quantize_tile(float * tile, uint8_t * record, int bits, int iterations,
+                                 float * shared, int tid, sycl::nd_item<1> item) {
+    float * log_s_col = shared + OFF_LOG_S_COL;
+    float * log_s_row = shared + OFF_LOG_S_ROW;
+    float * s_col = shared + OFF_S_COL;
+    float * s_row = shared + OFF_S_ROW;
+    float * best_col = shared + OFF_BEST_COL;
+    float * best_row = shared + OFF_BEST_ROW;
+    float * col_std = shared + OFF_COL_STD;
+    float * row_std = shared + OFF_ROW_STD;
+    float * best_imbalance = shared + OFF_BEST_IMBALANCE;
+    float * better = shared + OFF_BETTER;
+    float * reduce = shared + OFF_REDUCE;
+
+    // Initialize scales
+    log_s_col[tid] = 0.0f;
+    log_s_row[tid] = 0.0f;
+    s_col[tid] = 1.0f;
+    s_row[tid] = 1.0f;
+    best_col[tid] = 1.0f;
+    best_row[tid] = 1.0f;
+    item.barrier();
+
+    // Initial std computation
+    col_std[tid] = kvarn_std_col(tile, s_col, s_row, tid);
+    row_std[tid] = kvarn_std_row(tile, s_col, s_row, tid);
+    item.barrier();
+
+    if (tid == 0) {
+        *best_imbalance = 3.402823466e+38F;
+    }
+    item.barrier();
+
+    kvarn_update_best_from_std(s_col, s_row, false, best_col, best_row, col_std, row_std, best_imbalance, better, reduce, tid, item);
+
+    // Iterative Sinkhorn-like optimization
+    for (int iter = 0; iter < iterations; ++iter) {
+        const float col = fminf(fmaxf(col_std[tid], 1e-3f), 1e3f);
+        log_s_col[tid] = fminf(fmaxf(log_s_col[tid] + logf(col), -0.3f), 10.0f);
+        s_col[tid] = expf(log_s_col[tid]);
+        item.barrier();
+
+        row_std[tid] = kvarn_std_row(tile, s_col, s_row, tid);
+        item.barrier();
+
+        const float row = fminf(fmaxf(row_std[tid], 1e-3f), 1e3f);
+        log_s_row[tid] = fminf(fmaxf(log_s_row[tid] + logf(row), -0.3f), 10.0f);
+        s_row[tid] = expf(log_s_row[tid]);
+        item.barrier();
+
+        row_std[tid] = kvarn_std_row(tile, s_col, s_row, tid);
+        col_std[tid] = kvarn_std_col(tile, s_col, s_row, tid);
+        item.barrier();
+
+        kvarn_update_best_from_std(s_col, s_row, false, best_col, best_row, col_std, row_std, best_imbalance, better, reduce, tid, item);
+    }
+
+    // Find min/max for uniform quantization
+    const int row = tid;
+    float lo = 3.402823466e+38F;
+    float hi = -3.402823466e+38F;
+    for (int col = 0; col < KVAR_N_DIM; ++col) {
+        const float x = tile[row * KVAR_N_DIM + col] / (best_col[col] * best_row[row]);
+        lo = fminf(lo, x);
+        hi = fmaxf(hi, x);
+    }
+
+    const int qmax = (1 << bits) - 1;
+    const float scale = fmaxf((hi - lo) / qmax, 1e-10f);
+    const int row_bytes = KVAR_N_DIM * bits / 8;
+    uint8_t * row_payload = record + row * row_bytes;
+    for (int i = 0; i < row_bytes; ++i) {
+        row_payload[i] = 0;
+    }
+    for (int col = 0; col < KVAR_N_DIM; ++col) {
+        const float x = tile[row * KVAR_N_DIM + col] / (best_col[col] * best_row[row]);
+        const uint8_t q = (uint8_t)fminf(fmaxf(roundf((x - lo) / scale), 0.0f), (float)qmax);
+        const int bit_offset = col * bits;
+        for (int bit = 0; bit < bits; ++bit) {
+            const int dst_bit = bit_offset + bit;
+            row_payload[dst_bit / 8] |= ((q >> bit) & 1u) << (dst_bit % 8);
+        }
+    }
+
+    // Write scale/zero-point/other metadata
+    const int payload_bytes = KVAR_N_TILE_VALUES * bits / 8;
+    sycl::half * scale_axis = (sycl::half *)(record + payload_bytes);
+    sycl::half * zp_axis = scale_axis + KVAR_N_DIM;
+    sycl::half * other_axis = zp_axis + KVAR_N_DIM;
+    scale_axis[row] = static_cast<sycl::half>(best_row[row] * scale);
+    zp_axis[row] = static_cast<sycl::half>(best_row[row] * lo);
+    other_axis[row] = static_cast<sycl::half>(best_col[row]);
+    item.barrier();
+}
+
+// Quantize a stage tile from the stage buffer
+static void kvarn_quantize_stage(
+        const sycl::half * stage, uint8_t * record,
+        int n_heads, int head, int stage_base, int stage_group,
+        int bits, int iterations, bool value, bool swa,
+        int stage_groups, int tail_groups,
+        float * shared, int tid, sycl::nd_item<1> item) {
+
+    float * tile = shared + OFF_TILE;
+    const int stage_slot = swa ? (stage_group % stage_groups) : (1 + ((stage_group - 1) % tail_groups));
+
+    // Load tile from stage buffer
+    for (int i = tid; i < KVAR_N_TILE_VALUES; i += KVAR_N_DIM) {
+        const int row = i / KVAR_N_DIM;
+        const int col = i % KVAR_N_DIM;
+        const int token = value ? row : col;
+        const int dim = value ? col : row;
+        const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
+        tile[i] = static_cast<float>(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
+    }
+    item.barrier();
+
+    kvarn_quantize_tile(tile, record, bits, iterations, shared, tid, item);
 }
 
 // Phase 1a: hishmem kernel skeleton
@@ -59,6 +304,7 @@ static void kvarn_store_kernel_hishmem(
 
     q.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> shared{sycl::range<1>(KVAR_N_SHARED_FLOATS), cgh};
+        float * shared_ptr = shared.get_pointer();
 
         cgh.parallel_for<>(nd_range, [=](sycl::nd_item<1> item) {
             const int head = item.get_group(0);
@@ -78,36 +324,54 @@ static void kvarn_store_kernel_hishmem(
 
                 const int stage_base = stream * KVAR_N_DIM * stage_groups;
 
+                // Flush old record when stage group fills (delayed mode)
+                if (!eager_records && pos == 0 && (swa ? group >= tail_groups : group > tail_groups)) {
+                    const int flush_group = group - tail_groups;
+                    const int flush_ring = swa ? flush_group % groups_per_stream : flush_group;
+                    const int flush_record_group = stream * groups_per_stream + flush_ring;
+                    uint8_t * record = records + (flush_record_group * n_heads + head) * record_bytes;
+                    kvarn_quantize_stage(stage, record, n_heads, head, stage_base, flush_group,
+                                         bits, iterations, value, swa, stage_groups, tail_groups,
+                                         shared_ptr, tid, item);
+                }
+
                 // Load F32 into shared memory
-                shared[tid] = current[(token * n_heads + head) * KVAR_N_DIM + tid];
+                shared_ptr[tid] = current[(token * n_heads + head) * KVAR_N_DIM + tid];
                 item.barrier();
 
                 // WHT: 7-stage butterfly transform
                 for (int h = 1; h < KVAR_N_DIM; h *= 2) {
                     if (tid < 64) {
                         const int j = (tid / h) * (2 * h) + (tid % h);
-                        const float a = shared[j];
-                        const float b = shared[j + h];
-                        shared[j] = a + b;
-                        shared[j + h] = a - b;
+                        const float a = shared_ptr[j];
+                        const float b = shared_ptr[j + h];
+                        shared_ptr[j] = a + b;
+                        shared_ptr[j + h] = a - b;
                     }
                     item.barrier();
                 }
 
                 // Scale by 1/√128
-                shared[tid] *= 0.08838834764831845f;
+                shared_ptr[tid] *= 0.08838834764831845f;
                 item.barrier();
 
                 // Write to F16 stage buffer
                 const int stage_slot = swa ? (group % stage_groups) : (group == 0 ? 0 : 1 + ((group - 1) % tail_groups));
                 const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
                 stage[(stage_pos * n_heads + head) * KVAR_N_DIM + tid] =
-                    static_cast<sycl::half>(shared[tid]);
+                    static_cast<sycl::half>(shared_ptr[tid]);
 
                 item.barrier();
 
-                // Phase 1c/1d placeholder: quantization will go here
-                // For now skip record writing
+                // Eager record write when group completes
+                if (eager_records && pos == KVAR_N_DIM - 1 && (swa || group > 0)) {
+                    const int record_ring = swa ? group % groups_per_stream : group;
+                    const int record_group = stream * groups_per_stream + record_ring;
+                    uint8_t * record = records + (record_group * n_heads + head) * record_bytes;
+                    kvarn_quantize_stage(stage, record, n_heads, head, stage_base, group,
+                                         bits, iterations, value, swa, stage_groups, tail_groups,
+                                         shared_ptr, tid, item);
+                }
             }
         });
     });
