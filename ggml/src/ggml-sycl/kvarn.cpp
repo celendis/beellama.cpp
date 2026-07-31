@@ -377,6 +377,153 @@ static void kvarn_store_kernel_hishmem(
     });
 }
 
+// Headwide kernel: one work-group processes head_slices heads
+// Shared memory holds SLICES × 128 floats for the tile
+// Uses cross-slice Hadamard for multi-slice heads
+template<int SLICES>
+static void kvarn_store_kernel_headwide(
+        const float * __restrict__ current,
+        const int64_t * __restrict__ indices,
+        sycl::half * __restrict__ stage,
+        uint8_t * __restrict__ records,
+        int n_heads,
+        int n_tokens,
+        int n_stream,
+        int groups_per_stream,
+        int record_bytes,
+        int bits,
+        int iterations,
+        bool value,
+        bool swa,
+        int stage_groups,
+        int tail_groups,
+        bool eager_records,
+        queue_ptr q_ptr) {
+
+    sycl::queue q = *q_ptr;
+    const int n_groups = n_heads / SLICES;
+    sycl::nd_range<1> nd_range{n_groups * 128, 128};
+
+    q.submit([&](sycl::handler& cgh) {
+        // Shared memory: SLICES × 128 tile + metadata
+        sycl::local_accessor<float, 1> shared{sycl::range<1>(SLICES * KVAR_N_DIM + KVAR_N_SHARED_FLOATS), cgh};
+        float * shared_ptr = shared.get_pointer();
+
+        cgh.parallel_for<>(nd_range, [=](sycl::nd_item<1> item) {
+            const int group = item.get_group(0);
+            if (group >= n_groups) return;
+
+            const int head0 = group * SLICES;
+            if (head0 + SLICES > n_heads) return;
+
+            const int tid = item.get_local_id()[0];
+
+            for (int token = 0; token < n_tokens; ++token) {
+                const int64_t idx = indices[token];
+                const int group_global = (int)(idx / KVAR_N_DIM);
+                const int pos = (int)(idx % KVAR_N_DIM);
+                const int stream = swa ? 0 : group_global / groups_per_stream;
+                const int group_idx = swa ? group_global : group_global - stream * groups_per_stream;
+                if (stream < 0 || stream >= n_stream || group_idx < 0 || (!swa && group_idx >= groups_per_stream)) {
+                    return;
+                }
+
+                const int stage_base = stream * KVAR_N_DIM * stage_groups;
+
+                // Flush old records (delayed mode)
+                if (!eager_records && pos == 0 && (swa ? group_idx >= tail_groups : group_idx > tail_groups)) {
+                    const int flush_group = group_idx - tail_groups;
+                    const int flush_ring = swa ? flush_group % groups_per_stream : flush_group;
+                    const int flush_record_group = stream * groups_per_stream + flush_ring;
+                    for (int slice = 0; slice < SLICES; ++slice) {
+                        const int head = head0 + slice;
+                        uint8_t * record = records + (flush_record_group * n_heads + head) * record_bytes;
+                        // Load tile from stage into shared tile area
+                        float * tile = shared_ptr + slice * KVAR_N_DIM;
+                        const int stage_slot = swa ? (flush_group % stage_groups) : (1 + ((flush_group - 1) % tail_groups));
+                        for (int i = tid; i < KVAR_N_DIM; i += KVAR_N_DIM) {
+                            const int token_val = value ? i : tid;
+                            const int dim = value ? tid : i;
+                            const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + token_val;
+                            tile[i] = static_cast<float>(stage[(stage_pos * n_heads + head) * KVAR_N_DIM + dim]);
+                        }
+                        item.barrier();
+                        kvarn_quantize_tile(tile, record, bits, iterations, shared_ptr + SLICES * KVAR_N_DIM, tid, item);
+                    }
+                }
+
+                // Load + WHT per slice
+                float values[4] = {0};
+                for (int slice = 0; slice < SLICES; ++slice) {
+                    const int head = head0 + slice;
+                    float * tile = shared_ptr + slice * KVAR_N_DIM;
+                    tile[tid] = current[(token * n_heads + head) * KVAR_N_DIM + tid];
+                    item.barrier();
+
+                    // WHT butterfly
+                    for (int h = 1; h < KVAR_N_DIM; h *= 2) {
+                        if (tid < 64) {
+                            const int j = (tid / h) * (2 * h) + (tid % h);
+                            const float a = tile[j];
+                            const float b = tile[j + h];
+                            tile[j] = a + b;
+                            tile[j + h] = a - b;
+                        }
+                        item.barrier();
+                    }
+                    tile[tid] *= 0.08838834764831845f;
+                    item.barrier();
+
+                    values[slice] = tile[tid];
+                }
+
+                // Cross-slice Hadamard
+                if (SLICES == 2) {
+                    const float a = values[0];
+                    const float b = values[1];
+                    values[0] = (a + b) * 0.7071067811865475f;
+                    values[1] = (a - b) * 0.7071067811865475f;
+                } else if (SLICES == 4) {
+                    const float a0 = values[0];
+                    const float a1 = values[1];
+                    const float a2 = values[2];
+                    const float a3 = values[3];
+                    const float b0 = a0 + a1;
+                    const float b1 = a0 - a1;
+                    const float b2 = a2 + a3;
+                    const float b3 = a2 - a3;
+                    values[0] = (b0 + b2) * 0.5f;
+                    values[1] = (b1 + b3) * 0.5f;
+                    values[2] = (b0 - b2) * 0.5f;
+                    values[3] = (b1 - b3) * 0.5f;
+                }
+
+                // Write to stage buffer
+                const int stage_slot = swa ? (group_idx % stage_groups) : (group_idx == 0 ? 0 : 1 + ((group_idx - 1) % tail_groups));
+                const int stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
+                for (int slice = 0; slice < SLICES; ++slice) {
+                    const int head = head0 + slice;
+                    stage[(stage_pos * n_heads + head) * KVAR_N_DIM + tid] =
+                        static_cast<sycl::half>(values[slice]);
+                }
+                item.barrier();
+
+                // Eager record write
+                if (eager_records && pos == KVAR_N_DIM - 1 && (swa || group_idx > 0)) {
+                    const int record_ring = swa ? group_idx % groups_per_stream : group_idx;
+                    const int record_group = stream * groups_per_stream + record_ring;
+                    for (int slice = 0; slice < SLICES; ++slice) {
+                        const int head = head0 + slice;
+                        uint8_t * record = records + (record_group * n_heads + head) * record_bytes;
+                        float * tile = shared_ptr + slice * KVAR_N_DIM;
+                        kvarn_quantize_tile(tile, record, bits, iterations, shared_ptr + SLICES * KVAR_N_DIM, tid, item);
+                    }
+                }
+            }
+        });
+    });
+}
+
 // Phase 1a dispatch — hishmem only, head_slices == 1
 void ggml_sycl_op_kvarn_store(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * current = dst->src[0];
@@ -419,29 +566,68 @@ void ggml_sycl_op_kvarn_store(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     GGML_ASSERT(n_heads % head_slices == 0);
     const int n_tokens = (int)current->ne[2];
 
-    // Phase 1a: hishmem only, head_slices == 1
-    // TODO: add headwide, lowshmem, workspace, direct paths
-    GGML_ASSERT(head_slices == 1 && "head_slices > 1 not yet supported in SYCL");
-
-    kvarn_store_kernel_hishmem(
-        (const float *)current->data,
-        (const int64_t *)indices->data,
-        (sycl::half *)stage->data,
-        (uint8_t *)records->data,
-        n_heads,
-        n_tokens,
-        n_stream,
-        groups_per_stream,
-        (int)records->ne[0],
-        bits,
-        iterations,
-        value,
-        swa,
-        stage_groups,
-        tail_groups,
-        eager_records,
-        ctx.stream()
-    );
+    // Dispatch based on head_slices
+    if (head_slices == 1) {
+        kvarn_store_kernel_hishmem(
+            (const float *)current->data,
+            (const int64_t *)indices->data,
+            (sycl::half *)stage->data,
+            (uint8_t *)records->data,
+            n_heads,
+            n_tokens,
+            n_stream,
+            groups_per_stream,
+            (int)records->ne[0],
+            bits,
+            iterations,
+            value,
+            swa,
+            stage_groups,
+            tail_groups,
+            eager_records,
+            ctx.stream()
+        );
+    } else if (head_slices == 2) {
+        kvarn_store_kernel_headwide<2>(
+            (const float *)current->data,
+            (const int64_t *)indices->data,
+            (sycl::half *)stage->data,
+            (uint8_t *)records->data,
+            n_heads,
+            n_tokens,
+            n_stream,
+            groups_per_stream,
+            (int)records->ne[0],
+            bits,
+            iterations,
+            value,
+            swa,
+            stage_groups,
+            tail_groups,
+            eager_records,
+            ctx.stream()
+        );
+    } else if (head_slices == 4) {
+        kvarn_store_kernel_headwide<4>(
+            (const float *)current->data,
+            (const int64_t *)indices->data,
+            (sycl::half *)stage->data,
+            (uint8_t *)records->data,
+            n_heads,
+            n_tokens,
+            n_stream,
+            groups_per_stream,
+            (int)records->ne[0],
+            bits,
+            iterations,
+            value,
+            swa,
+            stage_groups,
+            tail_groups,
+            eager_records,
+            ctx.stream()
+        );
+    }
 }
 
 // Placeholder — materialize not yet implemented
