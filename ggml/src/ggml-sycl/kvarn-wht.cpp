@@ -42,7 +42,7 @@ static void kvarn_wht_kernel(
         sycl::local_accessor<float, 1> buf{sycl::range<1>(SLICES * 128), cgh};
 
         cgh.parallel_for<>(nd_range, [=](sycl::nd_item<1> item) {
-            const int64_t group = item.get_group_id()[0];
+            const int64_t group = item.get_group(0);
             if (group >= n_groups) return;
 
             const int tid = item.get_local_id()[0];
