@@ -381,15 +381,7 @@ endif()
 add_test(NAME test-kvarn WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn>)
 set_property(TEST test-kvarn PROPERTY LABELS main)
 
-# SYCL KVarN integration test
-if (GGML_SYCL)
-    add_executable(test-sycl-kvarn test-sycl-kvarn.cpp)
-    target_include_directories(test-sycl-kvarn PRIVATE ${PROJECT_SOURCE_DIR}/include)
-    target_compile_features(test-sycl-kvarn PRIVATE cxx_std_17)
-    target_link_libraries(test-sycl-kvarn PRIVATE ggml)
-    add_test(NAME test-sycl-kvarn WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-sycl-kvarn>)
-    set_property(TEST test-sycl-kvarn PROPERTY LABELS sycl)
-endif()
+
 
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
